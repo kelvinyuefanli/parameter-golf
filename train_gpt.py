@@ -186,10 +186,6 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # NorMuon: per-column RMS normalization for adaptive LR scaling.
-                    # Reduces variance across matrix columns, similar to Adafactor.
-                    col_rms = (g.square().mean(dim=0, keepdim=True) + 1e-8).rsqrt()
-                    g = g * col_rms * (g.size(1) ** 0.5)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     # Cautious weight decay: only apply where grad and param agree in sign.
