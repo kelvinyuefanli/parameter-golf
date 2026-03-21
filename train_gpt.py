@@ -75,7 +75,7 @@ class Hyperparameters:
     lawa_k = int(os.environ.get("LAWA_K", 5))
 
     # Dynamic evaluation: gradient updates during final eval.
-    dynamic_eval_lr = float(os.environ.get("DYNAMIC_EVAL_LR", 1e-4))
+    dynamic_eval_lr = float(os.environ.get("DYNAMIC_EVAL_LR", 1e-6))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
