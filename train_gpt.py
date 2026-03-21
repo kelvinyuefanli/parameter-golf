@@ -74,9 +74,6 @@ class Hyperparameters:
     # LAWA: average last k checkpoints during warmdown.
     lawa_k = int(os.environ.get("LAWA_K", 5))
 
-    # Dynamic evaluation: gradient updates during final eval.
-    dynamic_eval_lr = float(os.environ.get("DYNAMIC_EVAL_LR", 1e-6))
-
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -329,73 +326,80 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
-def eval_val_dynamic(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    grad_accum_steps: int,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
-    # Sliding window dynamic eval: overlapping windows with gradient updates.
-    # Each window has full seq_len context. Score last `dyn_stride` tokens,
-    # then gradient update improves predictions for subsequent windows.
-    # Combines sliding window benefit (more context) with TTT (weight adaptation).
-    seq_len = args.train_seq_len
-    dyn_stride = int(os.environ.get("DYN_EVAL_STRIDE", 1024))
-    dyn_stride = min(dyn_stride, seq_len)
+
+class OnlineNgram:
+    def __init__(self, V: int, a: float = 0.1):
+        self.V, self.a, self.total = V, a, 0
+        self.uni = torch.zeros(V, dtype=torch.float32)
+        self.bi: dict[int, Tensor] = {}
+        self.tri: dict[tuple[int, int], Tensor] = {}
+    def update(self, ids: Tensor) -> None:
+        t = ids.cpu().tolist()
+        for i, tok in enumerate(t):
+            self.uni[tok] += 1; self.total += 1
+            if i >= 1:
+                k = t[i-1]
+                if k not in self.bi: self.bi[k] = torch.zeros(self.V, dtype=torch.float32)
+                self.bi[k][tok] += 1
+            if i >= 2:
+                k2 = (t[i-2], t[i-1])
+                if k2 not in self.tri: self.tri[k2] = torch.zeros(self.V, dtype=torch.float32)
+                self.tri[k2][tok] += 1
+    def log_probs(self, p2: int | None, p1: int, dev: torch.device) -> Tensor:
+        u = (self.uni + self.a) / (self.total + self.a * self.V)
+        b = ((self.bi[p1] + self.a) / (self.bi[p1].sum() + self.a * self.V)) if p1 in self.bi else u
+        t = ((self.tri[(p2,p1)] + self.a) / (self.tri[(p2,p1)].sum() + self.a * self.V)) if p2 is not None and (p2,p1) in self.tri else b
+        return torch.log(0.5*t + 0.3*b + 0.2*u + 1e-10).to(dev)
+
+def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
+    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+    ngram_mix_weight: float = 0.05) -> tuple[float, float]:
+    seq_len, stride = args.train_seq_len, min(args.eval_stride, args.train_seq_len) if args.eval_stride > 0 else args.train_seq_len
     total_tokens = val_tokens.numel() - 1
-    num_windows = max(1, (total_tokens - seq_len) // dyn_stride + 1)
-    win_start = (num_windows * rank) // world_size
-    win_end = (num_windows * (rank + 1)) // world_size
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    # Only update block parameters, freeze embeddings for stability.
-    block_params = [p for n, p in model.named_parameters() if "blocks." in n and p.requires_grad]
-    dyn_optimizer = torch.optim.Adam(block_params, lr=args.dynamic_eval_lr, betas=(0.9, 0.999))
-    dyn_base = model.module if hasattr(model, 'module') else model
-    dyn_raw = dyn_base._orig_mod if hasattr(dyn_base, '_orig_mod') else dyn_base
-    model.train()
-    for win_idx in range(win_start, win_end):
-        start = win_idx * dyn_stride
-        end = min(start + seq_len, total_tokens)
-        window = val_tokens[start:end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-        if window.numel() - 1 < seq_len:
-            window = F.pad(window, (0, seq_len - (window.numel() - 1)), value=0)
-        x = window[:seq_len].unsqueeze(0)
-        y = window[1:seq_len + 1].unsqueeze(0)
-        bg = dyn_raw._compute_bigram_ids(x) if hasattr(dyn_raw, 'bigram_buckets') and dyn_raw.bigram_buckets > 0 else None
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            logits = dyn_base.forward_logits(x, bg)
-        score_len = min(dyn_stride, end - start)
-        scored_logits = logits[:, -score_len:]
-        scored_targets = y[:, -score_len:]
-        loss = F.cross_entropy(scored_logits.reshape(-1, scored_logits.size(-1)).float(),
-                               scored_targets.reshape(-1), reduction="mean")
-        val_loss_sum += loss.detach().to(torch.float64) * score_len
-        val_token_count += score_len
-        prev_for_bpb = x[0, -(score_len + 1):-1] if score_len < seq_len else x[0, :score_len]
-        tgt_ids = scored_targets.reshape(-1)
-        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_for_bpb[-score_len:]]).to(dtype=torch.int16)
-        val_byte_count += token_bytes.to(torch.float64).sum()
-        # Gradient update on scored tokens.
-        loss.backward()
-        dyn_optimizer.step()
-        dyn_optimizer.zero_grad(set_to_none=True)
+    num_windows = max(1, (total_tokens - seq_len) // stride + 1)
+    ws, we = (num_windows * rank) // world_size, (num_windows * (rank + 1)) // world_size
+    mb = max(1, args.val_batch_size // seq_len)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    tok_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    bm = model.module if hasattr(model, 'module') else model
+    ng = OnlineNgram(args.vocab_size)
+    model.eval()
+    with torch.inference_mode():
+        for bs in range(ws, we, mb):
+            be = min(bs + mb, we)
+            xl, yl = [], []
+            for wi in range(bs, be):
+                s = wi * stride; e = min(s + seq_len, total_tokens)
+                w = val_tokens[s:e+1].to(dtype=torch.int64)
+                if w.numel()-1 < seq_len: w = F.pad(w, (0, seq_len-(w.numel()-1)), value=0)
+                xl.append(w[:seq_len]); yl.append(w[1:seq_len+1])
+            x = torch.stack(xl).to(device=device, non_blocking=True)
+            y = torch.stack(yl).to(device=device, non_blocking=True)
+            raw = bm._orig_mod if hasattr(bm, '_orig_mod') else bm
+            bg = raw._compute_bigram_ids(x) if hasattr(raw, 'bigram_buckets') and raw.bigram_buckets > 0 else None
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = bm.forward_logits(x, bg)
+            sl = stride; slog = logits[:, -sl:].float(); stgt = y[:, -sl:]
+            if ng.total > 100:
+                for b in range(slog.size(0)):
+                    for t in range(sl):
+                        p1 = int(x[b, -sl+t-1].item()) if t > 0 else int(x[b, -sl-1].item())
+                        p2 = int(x[b, -sl+t-2].item()) if t > 1 else None
+                        tlp = F.log_softmax(slog[b, t], dim=-1)
+                        slog[b, t] = (1-ngram_mix_weight)*tlp + ngram_mix_weight*ng.log_probs(p2, p1, device)
+            loss = F.cross_entropy(slog.reshape(-1, slog.size(-1)), stgt.reshape(-1), reduction="sum")
+            loss_sum += loss.to(torch.float64); tok_count += slog.size(0) * sl
+            pi = x[:, -(sl+1):-1].reshape(-1) if seq_len > sl else x[:, :sl].reshape(-1)
+            ti = stgt.reshape(-1)
+            tb = base_bytes_lut[ti].to(dtype=torch.int16)
+            tb += (has_leading_space_lut[ti] & ~is_boundary_token_lut[pi]).to(dtype=torch.int16)
+            byte_count += tb.to(torch.float64).sum()
+            for b in range(y.size(0)): ng.update(stgt[b])
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+        for t in [loss_sum, tok_count, byte_count]: dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = loss_sum / tok_count
+    return float(vl.item()), float(vl.item() / math.log(2.0) * tok_count.item() / byte_count.item())
 
 
 # POST-TRAINING QUANTIZATION
@@ -1162,7 +1166,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"qat_fraction:{args.qat_fraction} lawa_k:{args.lawa_k} dynamic_eval_lr:{args.dynamic_eval_lr}")
+    log0(f"qat_fraction:{args.qat_fraction} lawa_k:{args.lawa_k}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1450,29 +1454,21 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    # Dynamic evaluation: reload quantized weights and run with gradient updates.
-    if args.dynamic_eval_lr > 0:
+    # N-gram mixed evaluation: blend transformer with online n-gram model.
+    ngram_mix = float(os.environ.get("NGRAM_MIX_WEIGHT", 0.05))
+    if ngram_mix > 0:
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
         torch.cuda.synchronize()
-        t_deval = time.perf_counter()
-        d_val_loss, d_val_bpb = eval_val_dynamic(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
+        t_neval = time.perf_counter()
+        n_val_loss, n_val_bpb = eval_val_ngram(
+            args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            ngram_mix_weight=ngram_mix,
         )
         torch.cuda.synchronize()
-        log0(
-            f"final_dynamic_eval val_loss:{d_val_loss:.4f} val_bpb:{d_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_deval):.0f}ms"
-        )
-        log0(f"final_dynamic_eval_exact val_loss:{d_val_loss:.8f} val_bpb:{d_val_bpb:.8f}")
+        log0(f"final_ngram_eval val_loss:{n_val_loss:.4f} val_bpb:{n_val_bpb:.4f} "
+             f"eval_time:{1000.0 * (time.perf_counter() - t_neval):.0f}ms")
+        log0(f"final_ngram_eval_exact val_loss:{n_val_loss:.8f} val_bpb:{n_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
