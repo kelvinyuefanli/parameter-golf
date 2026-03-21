@@ -113,6 +113,7 @@ class Hyperparameters:
     train_on_val = bool(int(os.environ.get("TRAIN_ON_VAL", "0")))
     enable_mtp = bool(int(os.environ.get("ENABLE_MTP", "1")))
     eval_only = os.environ.get("EVAL_ONLY", "")  # Path to .int8.ptz file; skip training
+    eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 1.0))  # Logit temperature
 
 # MUON OPTIMIZER
 
@@ -300,9 +301,10 @@ def eval_val(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = base_model.forward_logits(x, bg)  # [batch, seq_len, vocab]
 
-            # Score only the last `stride` tokens of each window.
             score_len = stride
             scored_logits = logits[:, -score_len:].reshape(-1, logits.size(-1))
+            if args.eval_temperature != 1.0:
+                scored_logits = scored_logits / args.eval_temperature
             scored_targets = y[:, -score_len:].reshape(-1)
             loss = F.cross_entropy(scored_logits.float(), scored_targets, reduction="sum")
             val_loss_sum += loss.to(torch.float64)
@@ -389,7 +391,8 @@ def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = bm.forward_logits(x, bg)
             sl = stride; slog = logits[:, -sl:].float(); stgt = y[:, -sl:]
-            # Vectorized n-gram mixing on scored tokens.
+            if args.eval_temperature != 1.0:
+                slog = slog / args.eval_temperature
             if ng.total > 100:
                 prev = x[:, -(sl+1):-1].reshape(-1).to(device)  # [batch*sl]
                 ng_lp = ng.batch_log_probs(prev, device)  # [batch*sl, V]
