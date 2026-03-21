@@ -106,8 +106,19 @@ class Hyperparameters:
     # Sliding window eval: stride < seq_len gives overlapping context.
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
-    # Quantization bit width for export.
+    # Quantization bit width for export. mlp_bits=5 uses int5 for MLP weights (better compression).
     quant_bits = int(os.environ.get("QUANT_BITS", 6))
+    mlp_bits = int(os.environ.get("MLP_BITS", 5))
+
+    # SmearGate: blend adjacent token embeddings.
+    smeargate = bool(int(os.environ.get("SMEARGATE", "1")))
+
+    # BigramHash: hash-based bigram embeddings.
+    bigram_buckets = int(os.environ.get("BIGRAM_BUCKETS", 10240))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+
+    # Val-set training: mix validation data into training.
+    train_on_val = bool(int(os.environ.get("TRAIN_ON_VAL", "0")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -266,54 +277,58 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Sliding window evaluation: use stride < seq_len for overlapping context.
-    # Only the last `stride` tokens of each window count toward the loss/BPB,
-    # but the full seq_len of context is available for prediction.
-    # With stride=64 and seq_len=2048, this gives ~0.034 BPB improvement for free.
+    # Sliding window eval: each window is seq_len tokens, windows overlap by (seq_len - stride).
+    # Only the last `stride` tokens per window are scored. Batched for speed.
     seq_len = args.train_seq_len
     stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
     total_tokens = val_tokens.numel() - 1
-
-    # Split work across ranks.
     num_windows = max(1, (total_tokens - seq_len) // stride + 1)
     win_start = (num_windows * rank) // world_size
     win_end = (num_windows * (rank + 1)) // world_size
 
+    # Batch size: fit as many windows as we can. Each window is seq_len tokens.
+    max_batch = max(1, args.val_batch_size // seq_len)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    base_model = model.module if hasattr(model, 'module') else model
 
     model.eval()
     with torch.inference_mode():
-        for win_idx in range(win_start, win_end):
-            start = win_idx * stride
-            end = min(start + seq_len, total_tokens)
-            local = val_tokens[start:end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].unsqueeze(0)  # [1, window_len]
-            y = local[1:].unsqueeze(0)
+        for batch_start in range(win_start, win_end, max_batch):
+            batch_end = min(batch_start + max_batch, win_end)
+            batch_size = batch_end - batch_start
+            # Build batch of windows.
+            x_list, y_list = [], []
+            for win_idx in range(batch_start, batch_end):
+                start = win_idx * stride
+                end = min(start + seq_len, total_tokens)
+                window = val_tokens[start:end + 1].to(dtype=torch.int64)
+                # Pad short windows (last window may be shorter).
+                if window.numel() - 1 < seq_len:
+                    pad_len = seq_len - (window.numel() - 1)
+                    window = F.pad(window, (0, pad_len), value=0)
+                x_list.append(window[:seq_len])
+                y_list.append(window[1:seq_len + 1])
+            x = torch.stack(x_list).to(device=device, non_blocking=True)
+            y = torch.stack(y_list).to(device=device, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits_flat = model.module.forward_logits(x) if hasattr(model, 'module') else model.forward_logits(x)
+                logits = base_model.forward_logits(x)  # [batch, seq_len, vocab]
 
-            # Only score the last `stride` tokens (or all if stride == seq_len).
-            score_len = min(stride, end - start)
-            scored_logits = logits_flat[:, -score_len:]
-            scored_targets = y[:, -score_len:]
-            loss = F.cross_entropy(scored_logits.reshape(-1, scored_logits.size(-1)).float(),
-                                   scored_targets.reshape(-1), reduction="sum")
+            # Score only the last `stride` tokens of each window.
+            score_len = stride
+            scored_logits = logits[:, -score_len:].reshape(-1, logits.size(-1))
+            scored_targets = y[:, -score_len:].reshape(-1)
+            loss = F.cross_entropy(scored_logits.float(), scored_targets, reduction="sum")
             val_loss_sum += loss.to(torch.float64)
-            val_token_count += score_len
+            val_token_count += batch_size * score_len
 
-            # BPB byte counting on scored tokens only.
-            prev_ids = x[:, -score_len:].reshape(-1) if score_len < x.size(1) else x[:, -score_len-1:-1].reshape(-1) if score_len < x.size(1) else x.reshape(-1)[-score_len:]
-            tgt_ids = scored_targets.reshape(-1)
-            # Get the token before each scored token for boundary detection.
-            if score_len < x.size(1):
-                prev_for_boundary = x[0, -(score_len+1):-1] if score_len + 1 <= x.size(1) else x[0, :score_len]
-            else:
-                prev_for_boundary = x[0]
+            # BPB byte counting on scored positions.
+            prev_ids = x[:, -(score_len + 1):-1].reshape(-1) if seq_len > score_len else x[:, :score_len].reshape(-1)
+            tgt_ids = scored_targets
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_for_boundary[-score_len:]]).to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
@@ -457,7 +472,7 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, mlp_bits: int = 0):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -503,7 +518,11 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, bits=bits)
+        # Mixed precision: use mlp_bits for MLP weights if specified.
+        tensor_bits = bits
+        if mlp_bits > 0 and ("mlp." in name):
+            tensor_bits = mlp_bits
+        q, s = quantize_float_tensor(t, bits=tensor_bits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -839,6 +858,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        smeargate: bool = True,
+        bigram_buckets: int = 10240,
+        bigram_dim: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -857,6 +879,19 @@ class GPT(nn.Module):
             if tie_embeddings:
                 nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
         self.use_factored_emb = embed_rank > 0
+
+        # SmearGate: learned gate to blend current/previous token embeddings.
+        self.smeargate = smeargate
+        if smeargate:
+            self.smear_gate = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+        # BigramHash: hash-based bigram embedding table.
+        self.bigram_buckets = bigram_buckets
+        if bigram_buckets > 0:
+            self.bigram_embed = nn.Embedding(bigram_buckets, bigram_dim)
+            self.bigram_proj = CastedLinear(bigram_dim, model_dim, bias=False)
+            nn.init.normal_(self.bigram_embed.weight, std=0.01)
+            nn.init.zeros_(self.bigram_proj.weight)
 
         # Per-loop skip weights: one per loop iteration.
         self.skip_weights = nn.Parameter(torch.ones(num_loops, model_dim, dtype=torch.float32))
@@ -881,9 +916,23 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            # Orthogonal init on Q/K/V projections (muP-scaled).
+            elif isinstance(module, CausalSelfAttention):
+                for proj in [module.c_q, module.c_k, module.c_v]:
+                    nn.init.orthogonal_(proj.weight, gain=1.0 / (module.head_dim ** 0.5))
 
     def _trunk(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        # SmearGate: blend with previous token embedding.
+        if self.smeargate:
+            gate = torch.sigmoid(self.smear_gate).to(dtype=x.dtype)
+            x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))  # shift right, pad with zeros
+            x = (1 - gate) * x + gate * x_prev
+        # BigramHash: add bigram context.
+        if self.bigram_buckets > 0:
+            prev_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+            bigram_hash = (prev_ids.long() * 1000003 + input_ids.long()) % self.bigram_buckets
+            x = x + self.bigram_proj(self.bigram_embed(bigram_hash))
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         for loop_idx in range(self.num_loops):
@@ -1051,6 +1100,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        smeargate=args.smeargate,
+        bigram_buckets=args.bigram_buckets,
+        bigram_dim=args.bigram_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1142,7 +1194,8 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    train_pattern = args.val_files if args.train_on_val else args.train_files
+    train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1195,7 +1248,8 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_pattern = args.val_files if args.train_on_val else args.train_files
+    train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1360,7 +1414,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=args.quant_bits)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=args.quant_bits, mlp_bits=args.mlp_bits)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
