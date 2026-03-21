@@ -68,7 +68,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # QAT: enable fake quantization in last fraction of training.
-    qat_fraction = float(os.environ.get("QAT_FRACTION", 1.0))
+    qat_fraction = float(os.environ.get("QAT_FRACTION", 0.0))
     prune_fraction = float(os.environ.get("PRUNE_FRACTION", 0.03))
 
     # LAWA: average last k checkpoints during warmdown.
