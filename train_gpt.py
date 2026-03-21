@@ -56,7 +56,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_loops = int(os.environ.get("NUM_LOOPS", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -68,7 +68,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # QAT: enable fake quantization in last fraction of training.
-    qat_fraction = float(os.environ.get("QAT_FRACTION", 0.2))
+    qat_fraction = float(os.environ.get("QAT_FRACTION", 1.0))
     prune_fraction = float(os.environ.get("PRUNE_FRACTION", 0.03))
 
     # LAWA: average last k checkpoints during warmdown.
@@ -186,12 +186,17 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    # NorMuon: per-column RMS normalization for adaptive LR scaling.
+                    # Reduces variance across matrix columns, similar to Adafactor.
+                    col_rms = (g.square().mean(dim=0, keepdim=True) + 1e-8).rsqrt()
+                    g = g * col_rms * (g.size(1) ** 0.5)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    # Weight decay (decoupled, applied to update direction).
+                    # Cautious weight decay: only apply where grad and param agree in sign.
                     wd = group.get("weight_decay", 0.0)
                     if wd > 0:
-                        g = g + wd * p.data.to(g.dtype)
+                        mask = (g * p.data.to(g.dtype)) >= 0
+                        g = g + wd * p.data.to(g.dtype) * mask
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -330,87 +335,6 @@ def eval_val(
 
 
 
-class OnlineNgram:
-    # Vectorized n-gram model using tensor hash tables. No Python per-token loops.
-    def __init__(self, V: int, device: torch.device, a: float = 0.1):
-        self.V, self.a = V, a
-        self.uni = torch.zeros(V, device=device, dtype=torch.float32)
-        # Bigram: hash table [num_buckets, V] keyed by prev token
-        self.bi = torch.zeros(V, V, device=device, dtype=torch.float32)  # [prev, cur]
-        self.bi_total = torch.zeros(V, device=device, dtype=torch.float32)
-        self.total = 0
-    def update_batch(self, ids: Tensor) -> None:
-        # ids: [N] flat token sequence. Fully vectorized.
-        self.uni.scatter_add_(0, ids.long(), torch.ones_like(ids, dtype=torch.float32))
-        self.total += ids.numel()
-        if ids.numel() >= 2:
-            prev = ids[:-1].long(); cur = ids[1:].long()
-            self.bi.index_put_((prev, cur), torch.ones(prev.numel(), device=ids.device, dtype=torch.float32), accumulate=True)
-            self.bi_total.scatter_add_(0, prev, torch.ones_like(prev, dtype=torch.float32))
-    def batch_log_probs(self, prev_ids: Tensor, device: torch.device) -> Tensor:
-        # prev_ids: [N] previous token for each position. Returns [N, V] log-probs.
-        aV = self.a * self.V
-        uni_p = (self.uni + self.a) / (self.total + aV)  # [V]
-        # Bigram: gather rows for each prev token
-        bi_counts = self.bi[prev_ids.long()]  # [N, V]
-        bi_totals = self.bi_total[prev_ids.long()].unsqueeze(-1)  # [N, 1]
-        has_bi = (bi_totals > 0).float()
-        bi_p = (bi_counts + self.a) / (bi_totals + aV)  # [N, V]
-        # Interpolate: where we have bigram data use 0.7*bi + 0.3*uni, else just uni
-        mixed = has_bi * (0.7 * bi_p + 0.3 * uni_p.unsqueeze(0)) + (1 - has_bi) * uni_p.unsqueeze(0)
-        return torch.log(mixed + 1e-10)
-
-def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
-    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-    ngram_mix_weight: float = 0.05) -> tuple[float, float]:
-    seq_len = args.train_seq_len
-    stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
-    total_tokens = val_tokens.numel() - 1
-    num_windows = max(1, (total_tokens - seq_len) // stride + 1)
-    ws, we = (num_windows * rank) // world_size, (num_windows * (rank + 1)) // world_size
-    mb = max(1, args.val_batch_size // seq_len)
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    tok_count = torch.zeros((), device=device, dtype=torch.float64)
-    byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    bm = model.module if hasattr(model, 'module') else model
-    ng = OnlineNgram(args.vocab_size, device)
-    model.eval()
-    with torch.inference_mode():
-        for bs in range(ws, we, mb):
-            be = min(bs + mb, we)
-            xl, yl = [], []
-            for wi in range(bs, be):
-                s = wi * stride; e = min(s + seq_len, total_tokens)
-                w = val_tokens[s:e+1].to(dtype=torch.int64)
-                if w.numel()-1 < seq_len: w = F.pad(w, (0, seq_len-(w.numel()-1)), value=0)
-                xl.append(w[:seq_len]); yl.append(w[1:seq_len+1])
-            x = torch.stack(xl).to(device=device, non_blocking=True)
-            y = torch.stack(yl).to(device=device, non_blocking=True)
-            raw = bm._orig_mod if hasattr(bm, '_orig_mod') else bm
-            bg = raw._compute_bigram_ids(x) if hasattr(raw, 'bigram_buckets') and raw.bigram_buckets > 0 else None
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = bm.forward_logits(x, bg)
-            sl = stride; slog = logits[:, -sl:].float(); stgt = y[:, -sl:]
-            if args.eval_temperature != 1.0:
-                slog = slog / args.eval_temperature
-            if ng.total > 100:
-                prev = x[:, -(sl+1):-1].reshape(-1).to(device)  # [batch*sl]
-                ng_lp = ng.batch_log_probs(prev, device)  # [batch*sl, V]
-                t_lp = F.log_softmax(slog.reshape(-1, slog.size(-1)), dim=-1)
-                mixed = (1-ngram_mix_weight)*t_lp + ngram_mix_weight*ng_lp
-                slog = mixed.reshape(slog.shape)
-            loss = F.cross_entropy(slog.reshape(-1, slog.size(-1)), stgt.reshape(-1), reduction="sum")
-            loss_sum += loss.to(torch.float64); tok_count += slog.size(0) * sl
-            pi = x[:, -(sl+1):-1].reshape(-1) if seq_len > sl else x[:, :sl].reshape(-1)
-            ti = stgt.reshape(-1)
-            tb = base_bytes_lut[ti].to(dtype=torch.int16)
-            tb += (has_leading_space_lut[ti] & ~is_boundary_token_lut[pi]).to(dtype=torch.int16)
-            byte_count += tb.to(torch.float64).sum()
-            ng.update_batch(stgt.reshape(-1).to(device))  # Update with scored tokens
-    if dist.is_available() and dist.is_initialized():
-        for t in [loss_sum, tok_count, byte_count]: dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    vl = loss_sum / tok_count
-    return float(vl.item()), float(vl.item() / math.log(2.0) * tok_count.item() / byte_count.item())
 
 
 # POST-TRAINING QUANTIZATION
@@ -431,7 +355,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-FP16_EMBED_NAME_PATTERNS = ("tok_emb", "E_low", "E_up")
+FP16_EMBED_NAME_PATTERNS = ("tok_emb", "E_low", "E_up", "blocks.9.attn.c_k")
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -855,6 +779,7 @@ class GPT(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.num_loops = num_loops
         self.num_layers = num_layers
+        self.model_dim = model_dim
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
         self.mtp_weights: list[float] | None = None  # Set externally during training
@@ -901,6 +826,7 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
+        dim = self.model_dim
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -908,6 +834,11 @@ class GPT(nn.Module):
             elif isinstance(module, CausalSelfAttention):
                 for proj in [module.c_q, module.c_k, module.c_v]:
                     nn.init.orthogonal_(proj.weight, gain=1.0 / (module.head_dim ** 0.5))
+                # Output projection: muP-scaled orthogonal.
+                nn.init.orthogonal_(module.proj.weight, gain=1.0 / (dim ** 0.5))
+            elif isinstance(module, MLP):
+                # MLP output projection: muP-scaled orthogonal.
+                nn.init.orthogonal_(module.proj.weight, gain=1.0 / (dim ** 0.5))
 
     def _compute_bigram_ids(self, input_ids: Tensor) -> Tensor | None:
         # Pre-compute bigram hash indices OUTSIDE compiled graph.
@@ -1186,13 +1117,6 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         log0(f"eval_only val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} time:{1000*(time.perf_counter()-t0):.0f}ms")
-        ngram_mix = float(os.environ.get("NGRAM_MIX_WEIGHT", 0.05))
-        if ngram_mix > 0:
-            base_model.load_state_dict(clean_sd, strict=True)
-            t1 = time.perf_counter()
-            n_loss, n_bpb = eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, ngram_mix)
-            log0(f"eval_only ngram val_loss:{n_loss:.4f} val_bpb:{n_bpb:.4f} time:{1000*(time.perf_counter()-t1):.0f}ms")
         if distributed: dist.destroy_process_group()
         return
 
@@ -1349,15 +1273,22 @@ def main() -> None:
                 base_model.mtp_weights = None
 
         # QAT: enable fake quantization in CastedLinear for the last qat_fraction of training.
+        # MLP weights use mlp_bits (int5), attention weights use quant_bits (int6).
         if not qat_enabled and args.qat_fraction > 0:
             elapsed_frac = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(max_wallclock_ms or 1e9, 1.0)
             if elapsed_frac >= (1.0 - args.qat_fraction):
                 qat_enabled = True
-                for m in base_model.modules():
-                    if isinstance(m, CastedLinear):
-                        m._qat = True
-                        m._qat_bits = args.quant_bits
-                log0(f"qat:enabled at step {step} elapsed_frac:{elapsed_frac:.3f}")
+                for block in base_model.blocks:
+                    blk = block._orig_mod if hasattr(block, '_orig_mod') else block
+                    for m in blk.attn.modules():
+                        if isinstance(m, CastedLinear):
+                            m._qat = True
+                            m._qat_bits = args.quant_bits  # int6 for attention
+                    for m in blk.mlp.modules():
+                        if isinstance(m, CastedLinear):
+                            m._qat = True
+                            m._qat_bits = args.mlp_bits  # int5 for MLP
+                log0(f"qat:enabled at step {step} elapsed_frac:{elapsed_frac:.3f} attn_bits:{args.quant_bits} mlp_bits:{args.mlp_bits}")
 
         # SWA: collect checkpoints every swa_every steps during last swa_start_frac of warmdown.
         if scale < 1.0 and not swa_active:
@@ -1472,22 +1403,6 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
-
-    # N-gram mixed evaluation: blend transformer with online n-gram model.
-    ngram_mix = float(os.environ.get("NGRAM_MIX_WEIGHT", 0.05))
-    if ngram_mix > 0:
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-        torch.cuda.synchronize()
-        t_neval = time.perf_counter()
-        n_val_loss, n_val_bpb = eval_val_ngram(
-            args, model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            ngram_mix_weight=ngram_mix,
-        )
-        torch.cuda.synchronize()
-        log0(f"final_ngram_eval val_loss:{n_val_loss:.4f} val_bpb:{n_val_bpb:.4f} "
-             f"eval_time:{1000.0 * (time.perf_counter() - t_neval):.0f}ms")
-        log0(f"final_ngram_eval_exact val_loss:{n_val_loss:.8f} val_bpb:{n_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
