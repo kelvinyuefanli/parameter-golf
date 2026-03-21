@@ -114,13 +114,9 @@ class Hyperparameters:
 
     # Val-set training: mix validation data into training.
     train_on_val = bool(int(os.environ.get("TRAIN_ON_VAL", "0")))
+    enable_mtp = bool(int(os.environ.get("ENABLE_MTP", "1")))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# MUON OPTIMIZER
 
 _POLAR_EXPRESS_COEFFS = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
@@ -212,14 +208,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+# TOKENIZER-AGNOSTIC EVALUATION
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -308,8 +297,10 @@ def eval_val(
             x = torch.stack(x_list).to(device=device, non_blocking=True)
             y = torch.stack(y_list).to(device=device, non_blocking=True)
 
+            raw = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+            bg = raw._compute_bigram_ids(x) if hasattr(raw, 'bigram_buckets') and raw.bigram_buckets > 0 else None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = base_model.forward_logits(x)  # [batch, seq_len, vocab]
+                logits = base_model.forward_logits(x, bg)  # [batch, seq_len, vocab]
 
             # Score only the last `stride` tokens of each window.
             score_len = stride
@@ -377,8 +368,11 @@ def eval_val_dynamic(
         y = local[1:].reshape(-1, args.train_seq_len)
 
         # Forward pass — predictions count toward BPB.
+        dyn_base = model.module if hasattr(model, 'module') else model
+        dyn_raw = dyn_base._orig_mod if hasattr(dyn_base, '_orig_mod') else dyn_base
+        bg = dyn_raw._compute_bigram_ids(x) if hasattr(dyn_raw, 'bigram_buckets') and dyn_raw.bigram_buckets > 0 else None
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            batch_loss = model(x, y)
+            batch_loss = model(x, y, bg)
         batch_token_count = float(y.numel())
         val_loss_sum += batch_loss.detach().to(torch.float64) * batch_token_count
         val_token_count += batch_token_count
@@ -406,13 +400,7 @@ def eval_val_dynamic(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
-# -----------------------------
 # POST-TRAINING QUANTIZATION
-# -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -916,18 +904,21 @@ class GPT(nn.Module):
                 for proj in [module.c_q, module.c_k, module.c_v]:
                     nn.init.orthogonal_(proj.weight, gain=1.0 / (module.head_dim ** 0.5))
 
-    def _trunk(self, input_ids: Tensor) -> Tensor:
+    def _compute_bigram_ids(self, input_ids: Tensor) -> Tensor | None:
+        # Pre-compute bigram hash indices OUTSIDE compiled graph.
+        if self.bigram_buckets <= 0:
+            return None
+        prev_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        return (prev_ids.long() * 1000003 + input_ids.long()) % self.bigram_buckets
+
+    def _trunk(self, input_ids: Tensor, bigram_ids: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
-        # SmearGate: blend with previous token embedding.
         if self.smeargate:
             gate = torch.sigmoid(self.smear_gate).to(dtype=x.dtype)
-            x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))  # shift right, pad with zeros
+            x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
             x = (1 - gate) * x + gate * x_prev
-        # BigramHash: add bigram context.
-        if self.bigram_buckets > 0:
-            prev_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
-            bigram_hash = (prev_ids.long() * 1000003 + input_ids.long()) % self.bigram_buckets
-            x = x + self.bigram_proj(self.bigram_embed(bigram_hash))
+        if bigram_ids is not None:
+            x = x + self.bigram_proj(self.bigram_embed(bigram_ids))
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         for loop_idx in range(self.num_loops):
@@ -955,14 +946,13 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(flat)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
-        # Returns [batch, seq_len, vocab] logits for sliding window eval.
-        x = self._trunk(input_ids)
+    def forward_logits(self, input_ids: Tensor, bigram_ids: Tensor | None = None) -> Tensor:
+        x = self._trunk(input_ids, bigram_ids)
         logits = self._logits(x)
         return logits.reshape(input_ids.size(0), input_ids.size(1), -1)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self._trunk(input_ids)
+    def forward(self, input_ids: Tensor, target_ids: Tensor, bigram_ids: Tensor | None = None) -> Tensor:
+        x = self._trunk(input_ids, bigram_ids)
         logits = self._logits(x)
         targets = target_ids.reshape(-1)
         # Multi-token prediction: weighted CE against current + future targets.
@@ -1227,8 +1217,10 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                raw_model = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+                bg = raw_model._compute_bigram_ids(x) if args.bigram_buckets > 0 else None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, bg)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1304,8 +1296,10 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            raw_model = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+            bg = raw_model._compute_bigram_ids(x) if args.bigram_buckets > 0 else None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, bg)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1328,16 +1322,14 @@ def main() -> None:
         step += 1
 
         # MTP schedule: anneal multi-token prediction weights across training.
-        # First 1/3: predict +0 (1.0), +1 (0.5), +2 (0.25)
-        # Middle 1/3: predict +0 (1.0), +1 (0.3)
-        # Final 1/3: standard next-token only
-        elapsed_frac_mtp = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(max_wallclock_ms or 1e9, 1.0)
-        if max_wallclock_ms and elapsed_frac_mtp < 0.33:
-            base_model.mtp_weights = [1.0, 0.5, 0.25]
-        elif max_wallclock_ms and elapsed_frac_mtp < 0.67:
-            base_model.mtp_weights = [1.0, 0.3]
-        else:
-            base_model.mtp_weights = None
+        if args.enable_mtp:
+            elapsed_frac_mtp = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(max_wallclock_ms or 1e9, 1.0)
+            if max_wallclock_ms and elapsed_frac_mtp < 0.33:
+                base_model.mtp_weights = [1.0, 0.5, 0.25]
+            elif max_wallclock_ms and elapsed_frac_mtp < 0.67:
+                base_model.mtp_weights = [1.0, 0.3]
+            else:
+                base_model.mtp_weights = None
 
         # QAT: enable fake quantization in CastedLinear for the last qat_fraction of training.
         if not qat_enabled and args.qat_fraction > 0:
