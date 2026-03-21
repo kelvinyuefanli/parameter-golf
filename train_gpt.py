@@ -3,9 +3,7 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 
 Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
 """
-
 from __future__ import annotations
-
 import copy
 import glob
 import io
@@ -17,7 +15,11 @@ import sys
 import time
 import uuid
 import zlib
-import zstandard as zstd
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    HAS_ZSTD = False
 from pathlib import Path
 
 import numpy as np
@@ -28,15 +30,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# -----------------------------
 # HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -1418,8 +1412,10 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    cctx = zstd.ZstdCompressor(level=22)
-    quant_blob = cctx.compress(quant_raw)
+    if HAS_ZSTD:
+        quant_blob = zstd.ZstdCompressor(level=22).compress(quant_raw)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1437,8 +1433,11 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    dctx = zstd.ZstdDecompressor()
-    quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk, max_output_size=200_000_000)), map_location="cpu")
+    if HAS_ZSTD:
+        raw_data = zstd.ZstdDecompressor().decompress(quant_blob_disk, max_output_size=200_000_000)
+    else:
+        raw_data = zlib.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(raw_data), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
