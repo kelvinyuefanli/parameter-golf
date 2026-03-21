@@ -346,7 +346,7 @@ def eval_val_dynamic(
     # then gradient update improves predictions for subsequent windows.
     # Combines sliding window benefit (more context) with TTT (weight adaptation).
     seq_len = args.train_seq_len
-    dyn_stride = int(os.environ.get("DYN_EVAL_STRIDE", 512))
+    dyn_stride = int(os.environ.get("DYN_EVAL_STRIDE", 1024))
     dyn_stride = min(dyn_stride, seq_len)
     total_tokens = val_tokens.numel() - 1
     num_windows = max(1, (total_tokens - seq_len) // dyn_stride + 1)
