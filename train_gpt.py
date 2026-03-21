@@ -1103,9 +1103,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # Compile individual blocks (not full model) since the loop stays in eager Python.
-    for block in base_model.blocks:
-        torch.compile(block, dynamic=False)
+    base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     # Optimizer split:
