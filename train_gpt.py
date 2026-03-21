@@ -1090,7 +1090,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if not args.eval_only:
+        base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     # Optimizer split:
@@ -1178,10 +1179,8 @@ def main() -> None:
             raw_data = zlib.decompress(blob)
         quant_state = torch.load(io.BytesIO(raw_data), map_location="cpu")
         dq_sd = dequantize_state_dict_int8(quant_state)
-        # Strip _orig_mod. prefix if present (from torch.compile wrapper).
         clean_sd = {k.replace("_orig_mod.", ""): v for k, v in dq_sd.items()}
-        raw_mod = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
-        raw_mod.load_state_dict(clean_sd, strict=True)
+        base_model.load_state_dict(clean_sd, strict=True)
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
@@ -1189,7 +1188,7 @@ def main() -> None:
         log0(f"eval_only val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} time:{1000*(time.perf_counter()-t0):.0f}ms")
         ngram_mix = float(os.environ.get("NGRAM_MIX_WEIGHT", 0.05))
         if ngram_mix > 0:
-            raw_mod.load_state_dict(clean_sd, strict=True)
+            base_model.load_state_dict(clean_sd, strict=True)
             t1 = time.perf_counter()
             n_loss, n_bpb = eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, ngram_mix)
