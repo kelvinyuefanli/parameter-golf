@@ -1017,6 +1017,19 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    # Enable QAT BEFORE compile so torch.compile traces the STE path.
+    # When qat_fraction=1.0 (full training), QAT must be in the compiled graph.
+    if args.qat_fraction >= 1.0 and not args.eval_only:
+        for block in base_model.blocks:
+            for m in block.attn.modules():
+                if isinstance(m, CastedLinear):
+                    m._qat = True
+                    m._qat_bits = args.quant_bits  # int6 for attention
+            for m in block.mlp.modules():
+                if isinstance(m, CastedLinear):
+                    m._qat = True
+                    m._qat_bits = args.mlp_bits  # int5 for MLP
+        log0(f"qat:pre-compile enabled (full training QAT) attn_bits:{args.quant_bits} mlp_bits:{args.mlp_bits}")
     if not args.eval_only:
         base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
@@ -1269,8 +1282,8 @@ def main() -> None:
                 base_model.mtp_weights = None
 
         # QAT: enable fake quantization in CastedLinear for the last qat_fraction of training.
-        # MLP weights use mlp_bits (int5), attention weights use quant_bits (int6).
-        if not qat_enabled and args.qat_fraction > 0:
+        # When qat_fraction=1.0, QAT was pre-enabled before compile (see above).
+        if not qat_enabled and args.qat_fraction > 0 and args.qat_fraction < 1.0:
             elapsed_frac = (training_time_ms + 1000.0 * (time.perf_counter() - t0)) / max(max_wallclock_ms or 1e9, 1.0)
             if elapsed_frac >= (1.0 - args.qat_fraction):
                 qat_enabled = True
@@ -1279,12 +1292,14 @@ def main() -> None:
                     for m in blk.attn.modules():
                         if isinstance(m, CastedLinear):
                             m._qat = True
-                            m._qat_bits = args.quant_bits  # int6 for attention
+                            m._qat_bits = args.quant_bits
                     for m in blk.mlp.modules():
                         if isinstance(m, CastedLinear):
                             m._qat = True
-                            m._qat_bits = args.mlp_bits  # int5 for MLP
+                            m._qat_bits = args.mlp_bits
                 log0(f"qat:enabled at step {step} elapsed_frac:{elapsed_frac:.3f} attn_bits:{args.quant_bits} mlp_bits:{args.mlp_bits}")
+        elif args.qat_fraction >= 1.0 and not qat_enabled:
+            qat_enabled = True  # Already enabled pre-compile
 
         # SWA: collect checkpoints every swa_every steps during last swa_start_frac of warmdown.
         if scale < 1.0 and not swa_active:
