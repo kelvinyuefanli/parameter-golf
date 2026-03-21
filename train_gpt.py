@@ -112,6 +112,7 @@ class Hyperparameters:
     # Val-set training: mix validation data into training.
     train_on_val = bool(int(os.environ.get("TRAIN_ON_VAL", "0")))
     enable_mtp = bool(int(os.environ.get("ENABLE_MTP", "1")))
+    eval_only = os.environ.get("EVAL_ONLY", "")  # Path to .int8.ptz file; skip training
 
 # MUON OPTIMIZER
 
@@ -328,33 +329,40 @@ def eval_val(
 
 
 class OnlineNgram:
-    def __init__(self, V: int, a: float = 0.1):
-        self.V, self.a, self.total = V, a, 0
-        self.uni = torch.zeros(V, dtype=torch.float32)
-        self.bi: dict[int, Tensor] = {}
-        self.tri: dict[tuple[int, int], Tensor] = {}
-    def update(self, ids: Tensor) -> None:
-        t = ids.cpu().tolist()
-        for i, tok in enumerate(t):
-            self.uni[tok] += 1; self.total += 1
-            if i >= 1:
-                k = t[i-1]
-                if k not in self.bi: self.bi[k] = torch.zeros(self.V, dtype=torch.float32)
-                self.bi[k][tok] += 1
-            if i >= 2:
-                k2 = (t[i-2], t[i-1])
-                if k2 not in self.tri: self.tri[k2] = torch.zeros(self.V, dtype=torch.float32)
-                self.tri[k2][tok] += 1
-    def log_probs(self, p2: int | None, p1: int, dev: torch.device) -> Tensor:
-        u = (self.uni + self.a) / (self.total + self.a * self.V)
-        b = ((self.bi[p1] + self.a) / (self.bi[p1].sum() + self.a * self.V)) if p1 in self.bi else u
-        t = ((self.tri[(p2,p1)] + self.a) / (self.tri[(p2,p1)].sum() + self.a * self.V)) if p2 is not None and (p2,p1) in self.tri else b
-        return torch.log(0.5*t + 0.3*b + 0.2*u + 1e-10).to(dev)
+    # Vectorized n-gram model using tensor hash tables. No Python per-token loops.
+    def __init__(self, V: int, device: torch.device, a: float = 0.1):
+        self.V, self.a = V, a
+        self.uni = torch.zeros(V, device=device, dtype=torch.float32)
+        # Bigram: hash table [num_buckets, V] keyed by prev token
+        self.bi = torch.zeros(V, V, device=device, dtype=torch.float32)  # [prev, cur]
+        self.bi_total = torch.zeros(V, device=device, dtype=torch.float32)
+        self.total = 0
+    def update_batch(self, ids: Tensor) -> None:
+        # ids: [N] flat token sequence. Fully vectorized.
+        self.uni.scatter_add_(0, ids.long(), torch.ones_like(ids, dtype=torch.float32))
+        self.total += ids.numel()
+        if ids.numel() >= 2:
+            prev = ids[:-1].long(); cur = ids[1:].long()
+            self.bi.index_put_((prev, cur), torch.ones(prev.numel(), device=ids.device, dtype=torch.float32), accumulate=True)
+            self.bi_total.scatter_add_(0, prev, torch.ones_like(prev, dtype=torch.float32))
+    def batch_log_probs(self, prev_ids: Tensor, device: torch.device) -> Tensor:
+        # prev_ids: [N] previous token for each position. Returns [N, V] log-probs.
+        aV = self.a * self.V
+        uni_p = (self.uni + self.a) / (self.total + aV)  # [V]
+        # Bigram: gather rows for each prev token
+        bi_counts = self.bi[prev_ids.long()]  # [N, V]
+        bi_totals = self.bi_total[prev_ids.long()].unsqueeze(-1)  # [N, 1]
+        has_bi = (bi_totals > 0).float()
+        bi_p = (bi_counts + self.a) / (bi_totals + aV)  # [N, V]
+        # Interpolate: where we have bigram data use 0.7*bi + 0.3*uni, else just uni
+        mixed = has_bi * (0.7 * bi_p + 0.3 * uni_p.unsqueeze(0)) + (1 - has_bi) * uni_p.unsqueeze(0)
+        return torch.log(mixed + 1e-10)
 
 def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
     val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     ngram_mix_weight: float = 0.05) -> tuple[float, float]:
-    seq_len, stride = args.train_seq_len, min(args.eval_stride, args.train_seq_len) if args.eval_stride > 0 else args.train_seq_len
+    seq_len = args.train_seq_len
+    stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
     total_tokens = val_tokens.numel() - 1
     num_windows = max(1, (total_tokens - seq_len) // stride + 1)
     ws, we = (num_windows * rank) // world_size, (num_windows * (rank + 1)) // world_size
@@ -363,7 +371,7 @@ def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
     tok_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     bm = model.module if hasattr(model, 'module') else model
-    ng = OnlineNgram(args.vocab_size)
+    ng = OnlineNgram(args.vocab_size, device)
     model.eval()
     with torch.inference_mode():
         for bs in range(ws, we, mb):
@@ -381,13 +389,13 @@ def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = bm.forward_logits(x, bg)
             sl = stride; slog = logits[:, -sl:].float(); stgt = y[:, -sl:]
+            # Vectorized n-gram mixing on scored tokens.
             if ng.total > 100:
-                for b in range(slog.size(0)):
-                    for t in range(sl):
-                        p1 = int(x[b, -sl+t-1].item()) if t > 0 else int(x[b, -sl-1].item())
-                        p2 = int(x[b, -sl+t-2].item()) if t > 1 else None
-                        tlp = F.log_softmax(slog[b, t], dim=-1)
-                        slog[b, t] = (1-ngram_mix_weight)*tlp + ngram_mix_weight*ng.log_probs(p2, p1, device)
+                prev = x[:, -(sl+1):-1].reshape(-1).to(device)  # [batch*sl]
+                ng_lp = ng.batch_log_probs(prev, device)  # [batch*sl, V]
+                t_lp = F.log_softmax(slog.reshape(-1, slog.size(-1)), dim=-1)
+                mixed = (1-ngram_mix_weight)*t_lp + ngram_mix_weight*ng_lp
+                slog = mixed.reshape(slog.shape)
             loss = F.cross_entropy(slog.reshape(-1, slog.size(-1)), stgt.reshape(-1), reduction="sum")
             loss_sum += loss.to(torch.float64); tok_count += slog.size(0) * sl
             pi = x[:, -(sl+1):-1].reshape(-1) if seq_len > sl else x[:, :sl].reshape(-1)
@@ -395,7 +403,7 @@ def eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
             tb = base_bytes_lut[ti].to(dtype=torch.int16)
             tb += (has_leading_space_lut[ti] & ~is_boundary_token_lut[pi]).to(dtype=torch.int16)
             byte_count += tb.to(torch.float64).sum()
-            for b in range(y.size(0)): ng.update(stgt[b])
+            ng.update_batch(stgt.reshape(-1).to(device))  # Update with scored tokens
     if dist.is_available() and dist.is_initialized():
         for t in [loss_sum, tok_count, byte_count]: dist.all_reduce(t, op=dist.ReduceOp.SUM)
     vl = loss_sum / tok_count
@@ -552,9 +560,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-# -----------------------------
 # DATA LOADING 
-# -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -623,9 +629,7 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# -----------------------------
 # TRANSFORMER MODULES
-# -----------------------------
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -970,9 +974,7 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
-# -----------------------------
 # TRAINING
-# -----------------------------
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -981,9 +983,7 @@ def main() -> None:
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
-    # -----------------------------
     # DISTRIBUTED + CUDA SETUP
-    # -----------------------------
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1039,9 +1039,7 @@ def main() -> None:
     )
     log0("=" * 100, console=False)
 
-    # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
-    # -----------------------------
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1065,9 +1063,7 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
-    # -----------------------------
     # MODEL + OPTIMIZER SETUP
-    # -----------------------------
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -1169,9 +1165,30 @@ def main() -> None:
     log0(f"qat_fraction:{args.qat_fraction} lawa_k:{args.lawa_k}")
     log0(f"seed:{args.seed}")
 
-    # -----------------------------
-    # DATA LOADER & MODEL WARMUP
-    # -----------------------------
+    if args.eval_only:  # Skip training, load quantized model, run evals.
+        log0(f"eval_only: loading {args.eval_only}")
+        with open(args.eval_only, "rb") as f:
+            blob = f.read()
+        if HAS_ZSTD:
+            raw_data = zstd.ZstdDecompressor().decompress(blob, max_output_size=200_000_000)
+        else:
+            raw_data = zlib.decompress(blob)
+        quant_state = torch.load(io.BytesIO(raw_data), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+        log0(f"eval_only val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} time:{1000*(time.perf_counter()-t0):.0f}ms")
+        ngram_mix = float(os.environ.get("NGRAM_MIX_WEIGHT", 0.05))
+        if ngram_mix > 0:
+            base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+            t1 = time.perf_counter()
+            n_loss, n_bpb = eval_val_ngram(args, model, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, ngram_mix)
+            log0(f"eval_only ngram val_loss:{n_loss:.4f} val_bpb:{n_bpb:.4f} time:{1000*(time.perf_counter()-t1):.0f}ms")
+        if distributed: dist.destroy_process_group()
+        return
 
     train_pattern = args.val_files if args.train_on_val else args.train_files
     train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
@@ -1232,9 +1249,7 @@ def main() -> None:
         train_pattern = args.val_files if args.train_on_val else args.train_files
     train_loader = DistributedTokenLoader(train_pattern, rank, world_size, device)
 
-    # -----------------------------
     # MAIN TRAINING LOOP
-    # -----------------------------
 
     # SWA: average checkpoints every swa_every steps during the last swa_start_frac of warmdown.
     swa_state: dict[str, Tensor] | None = None
@@ -1378,9 +1393,7 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
-    # -----------------------------
     # Load LAWA averaged weights if available, then serialize.
 
     if swa_state is not None:
