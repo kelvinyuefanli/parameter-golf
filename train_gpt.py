@@ -802,9 +802,7 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
-        self.post_attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.post_mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -814,10 +812,8 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.post_attn_norm(self.attn(self.attn_norm(x)))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mlp_out = self.post_mlp_norm(self.mlp(self.mlp_norm(x)))
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -876,12 +872,12 @@ class GPT(nn.Module):
             nn.init.normal_(self.bigram_embed.weight, std=0.01)
             nn.init.zeros_(self.bigram_proj.weight)
 
-        # Per-loop skip weights: one per loop iteration.
-        self.skip_weights = nn.Parameter(torch.ones(num_loops, model_dim, dtype=torch.float32))
-
-        # Per-depth scales: one vector per (loop * num_layers) effective layer.
-        total_effective = num_loops * num_layers
-        self.depth_scales = nn.Parameter(torch.ones(total_effective, model_dim, dtype=torch.float32))
+        # U-Net skip weights: encoder layers store, decoder layers consume.
+        num_enc = num_layers // 2
+        num_dec = num_layers - num_enc
+        num_skip = min(num_enc, num_dec)
+        self.skip_weights = nn.Parameter(torch.ones(num_skip, model_dim, dtype=torch.float32))
+        self.num_skip = num_skip
 
         self.blocks = nn.ModuleList(
             [
@@ -921,16 +917,16 @@ class GPT(nn.Module):
             x = x + self.bigram_proj(self.bigram_embed(bigram_ids))
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        for loop_idx in range(self.num_loops):
-            skip: Tensor | None = None
-            for block_idx, block in enumerate(self.blocks):
-                if block_idx == 0:
-                    skip = x
-                x = block(x, x0)
-                depth_idx = loop_idx * self.num_layers + block_idx
-                x = x * self.depth_scales[depth_idx].to(dtype=x.dtype)[None, None, :]
-                if block_idx == self.num_layers - 1 and skip is not None:
-                    x = x + self.skip_weights[loop_idx].to(dtype=x.dtype)[None, None, :] * skip
+        # U-Net skip: first half stores, second half consumes (symmetric around middle).
+        num_enc = self.num_layers // 2
+        skips: list[Tensor] = []
+        for block_idx, block in enumerate(self.blocks):
+            x = block(x, x0)
+            if block_idx < num_enc:
+                skips.append(x)
+            elif skips:
+                skip_idx = len(skips) - 1
+                x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
         return self.final_norm(x)
 
     def _logits(self, x: Tensor) -> Tensor:
@@ -1114,8 +1110,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if base_model.depth_scales.numel() > 0:
-        scalar_params.append(base_model.depth_scales)
     # Collect embedding params (works for both FactoredEmbedding and nn.Embedding).
     embed_params = list(base_model.tok_emb.parameters())
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
