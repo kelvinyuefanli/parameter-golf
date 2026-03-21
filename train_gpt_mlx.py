@@ -47,29 +47,28 @@ class Hyperparameters:
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
-    # Training loop. These defaults now mirror train_gpt.py on a single process.
+    # Training loop.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
-    # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
-    # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
-    # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
-    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 3600))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model (defaults match the current baseline setup).
+    # Model: depth-recurrent with factored embeddings.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 3))
+    num_loops: int = int(os.environ.get("NUM_LOOPS", 3))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 768))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    embed_rank: int = int(os.environ.get("EMBED_RANK", 64))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -283,9 +282,30 @@ class CastedLinear(nn.Module):
 
 
 class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
     def __call__(self, x: mx.array) -> mx.array:
         return rms_norm(x)
+
+
+class FactoredEmbedding(nn.Module):
+    # Low-rank factored embedding: ids -> [vocab, E] -> [E, dim].
+    def __init__(self, vocab_size: int, dim: int, rank: int, init_std: float = 0.005):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.rank = rank
+        self.E_low = nn.Embedding(vocab_size, rank)
+        self.E_up = mx.random.normal((dim, rank), dtype=mx.float32) * init_std
+        self.E_low.weight = (mx.random.normal(self.E_low.weight.shape, dtype=mx.float32) * init_std).astype(COMPUTE_DTYPE)
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        # ids -> [vocab, rank] lookup -> [batch, seq, rank] @ [rank, dim] -> [batch, seq, dim]
+        h = self.E_low(ids)  # [batch, seq, rank]
+        return h.astype(self.E_up.dtype) @ self.E_up.T  # [batch, seq, dim]
+
+    def logits(self, x: mx.array) -> mx.array:
+        # Reverse: dim -> rank -> vocab.
+        h = x.astype(self.E_up.dtype) @ self.E_up  # [batch, dim] @ [dim, rank] -> [batch, rank]
+        return h @ self.E_low.weight.astype(h.dtype).T  # [batch, rank] @ [rank, vocab] -> [batch, vocab]
 
 
 class CausalSelfAttention(nn.Module):
@@ -359,7 +379,9 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
+        self.post_attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
+        self.post_mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
@@ -369,43 +391,53 @@ class Block(nn.Module):
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.post_attn_norm(self.attn(self.attn_norm(x)))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.post_mlp_norm(self.mlp(self.mlp_norm(x)))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp_out
         return x
 
 
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    # Depth-recurrent GPT: num_layers unique blocks looped num_loops times.
+    # Per-loop U-Net skips: Block 0 stores, Block[-1] consumes within each loop.
+    # Per-depth multiplicative scales differentiate loop iterations.
+    # FactoredEmbedding when embed_rank > 0, else standard nn.Embedding.
+    def __init__(self, vocab_size: int, num_layers: int, num_loops: int, dim: int,
+                 num_heads: int, num_kv_heads: int, mlp_mult: int, embed_rank: int,
+                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
+                 tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.num_layers = num_layers
+        self.num_loops = num_loops
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.use_factored_emb = embed_rank > 0
 
-        self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        if embed_rank > 0:
+            self.tok_emb = FactoredEmbedding(vocab_size, dim, embed_rank, init_std=tied_embed_init_std)
+        else:
+            self.tok_emb = nn.Embedding(vocab_size, dim)
+            self.tok_emb.weight = (
+                mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+            ).astype(COMPUTE_DTYPE)
+
+        # Per-loop skip weights and per-depth scales.
+        self.skip_weights = mx.ones((num_loops, dim), dtype=mx.float32)
+        total_effective = num_loops * num_layers
+        self.depth_scales = mx.ones((total_effective, dim), dtype=mx.float32)
+
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            for _ in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
-        self.tok_emb.weight = (
-            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
-        ).astype(COMPUTE_DTYPE)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
@@ -414,38 +446,34 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for loop_idx in range(self.num_loops):
+            skip = None
+            for block_idx, block in enumerate(self.blocks):
+                if block_idx == 0:
+                    skip = x
+                x = block(x, x0)
+                depth_idx = loop_idx * self.num_layers + block_idx
+                x = x * self.depth_scales[depth_idx].astype(x.dtype)[None, None, :]
+                if block_idx == self.num_layers - 1 and skip is not None:
+                    x = x + self.skip_weights[loop_idx].astype(x.dtype)[None, None, :] * skip
+
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        if self.use_factored_emb:
+            out_dim = self.tok_emb.dim
+        else:
+            out_dim = self.tok_emb.weight.shape[1]
+        x = self(input_ids).reshape(-1, out_dim)
         y = target_ids.reshape(-1)
-        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
-        loss_sum = mx.array(0.0, dtype=mx.float32)
-        n = int(x.shape[0])
-        for s in range(0, n, self.logit_chunk_tokens):
-            e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+        if self.use_factored_emb:
+            logits_proj = self.tok_emb.logits(x)
+        else:
+            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+        logits = self.softcap(logits_proj)
+        return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -486,7 +514,8 @@ class SplitOptimizers:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
-        self.embed_key = "tok_emb.weight"
+        # Embedding keys: either factored (E_low, E_up) or standard (tok_emb.weight).
+        self.embed_keys = [k for k in params if k.startswith("tok_emb.")]
         self.matrix_keys = [
             k
             for k, p in params.items()
@@ -495,7 +524,7 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k in ("skip_weights", "depth_scales") or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -520,12 +549,10 @@ class SplitOptimizers:
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
 
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
-        updated.update(
-            self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
-            )
-        )
+        embed_grads = {k: grads[k] for k in self.embed_keys if k in grads}
+        embed_params = {k: params[k] for k in self.embed_keys if k in params}
+        if embed_grads:
+            updated.update(self.adam_embed.apply_gradients(embed_grads, embed_params))
 
         self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
         scalar_grads = {k: grads[k] for k in self.scalar_keys}
@@ -882,10 +909,12 @@ def main() -> None:
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_loops=args.num_loops,
         dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        embed_rank=args.embed_rank,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
@@ -927,7 +956,9 @@ def main() -> None:
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
-        f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+        f"loops:{args.num_loops} effective_depth:{args.num_layers * args.num_loops} "
+        f"dim:{args.model_dim} embed_rank:{args.embed_rank} "
+        f"heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
@@ -946,7 +977,7 @@ def main() -> None:
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
-        f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
+        f"dtypes tok_emb:{model.tok_emb.E_low.weight.dtype if model.use_factored_emb else model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
@@ -1090,6 +1121,44 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Structured JSON output for autoresearch-style iteration.
+    code_bytes = len(code.encode("utf-8"))
+    result = {
+        "run_id": args.run_id,
+        "val_bpb": round(q_val_bpb, 8),
+        "val_loss": round(q_val_loss, 8),
+        "model_bytes": quant_file_bytes,
+        "code_bytes": code_bytes,
+        "total_bytes": quant_file_bytes + code_bytes,
+        "budget_remaining": 16_000_000 - (quant_file_bytes + code_bytes),
+        "fits_budget": (quant_file_bytes + code_bytes) <= 16_000_000,
+        "model_params": n_params,
+        "train_time_ms": round(train_time_ms, 0),
+        "steps_completed": step,
+        "tokens_seen": step * args.train_batch_tokens,
+        "config": {
+            "num_layers": args.num_layers,
+            "num_loops": args.num_loops,
+            "model_dim": args.model_dim,
+            "num_heads": args.num_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "mlp_mult": args.mlp_mult,
+            "embed_rank": args.embed_rank,
+            "vocab_size": args.vocab_size,
+            "train_seq_len": args.train_seq_len,
+            "warmdown_iters": args.warmdown_iters,
+            "matrix_lr": args.matrix_lr,
+            "scalar_lr": args.scalar_lr,
+            "tied_embed_lr": args.tied_embed_lr,
+        },
+    }
+    result_path = out_dir / f"{args.run_id}_result.json"
+    with result_path.open("w") as f:
+        json.dump(result, f, indent=2)
+    log(f"result_json:{result_path}")
+    # Print the key metric on its own line for easy parsing.
+    print(f"RESULT val_bpb={q_val_bpb:.8f} total_bytes={quant_file_bytes + code_bytes} fits={result['fits_budget']}")
 
 
 if __name__ == "__main__":
