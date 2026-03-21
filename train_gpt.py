@@ -341,59 +341,57 @@ def eval_val_dynamic(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Dynamic evaluation: forward pass counts toward BPB, then gradient update improves
-    # predictions for subsequent batches. Processes validation data sequentially.
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
-        raise ValueError("VAL_BATCH_SIZE too small for dynamic eval")
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    # Sliding window dynamic eval: overlapping windows with gradient updates.
+    # Each window has full seq_len context. Score last `dyn_stride` tokens,
+    # then gradient update improves predictions for subsequent windows.
+    # Combines sliding window benefit (more context) with TTT (weight adaptation).
+    seq_len = args.train_seq_len
+    dyn_stride = int(os.environ.get("DYN_EVAL_STRIDE", 512))
+    dyn_stride = min(dyn_stride, seq_len)
+    total_tokens = val_tokens.numel() - 1
+    num_windows = max(1, (total_tokens - seq_len) // dyn_stride + 1)
+    win_start = (num_windows * rank) // world_size
+    win_end = (num_windows * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
     # Only update block parameters, freeze embeddings for stability.
     block_params = [p for n, p in model.named_parameters() if "blocks." in n and p.requires_grad]
     dyn_optimizer = torch.optim.Adam(block_params, lr=args.dynamic_eval_lr, betas=(0.9, 0.999))
-
+    dyn_base = model.module if hasattr(model, 'module') else model
+    dyn_raw = dyn_base._orig_mod if hasattr(dyn_base, '_orig_mod') else dyn_base
     model.train()
-    for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-        batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-        raw_start = batch_seq_start * args.train_seq_len
-        raw_end = batch_seq_end * args.train_seq_len + 1
-        local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-        x = local[:-1].reshape(-1, args.train_seq_len)
-        y = local[1:].reshape(-1, args.train_seq_len)
-
-        # Forward pass — predictions count toward BPB.
-        dyn_base = model.module if hasattr(model, 'module') else model
-        dyn_raw = dyn_base._orig_mod if hasattr(dyn_base, '_orig_mod') else dyn_base
+    for win_idx in range(win_start, win_end):
+        start = win_idx * dyn_stride
+        end = min(start + seq_len, total_tokens)
+        window = val_tokens[start:end + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+        if window.numel() - 1 < seq_len:
+            window = F.pad(window, (0, seq_len - (window.numel() - 1)), value=0)
+        x = window[:seq_len].unsqueeze(0)
+        y = window[1:seq_len + 1].unsqueeze(0)
         bg = dyn_raw._compute_bigram_ids(x) if hasattr(dyn_raw, 'bigram_buckets') and dyn_raw.bigram_buckets > 0 else None
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            batch_loss = model(x, y, bg)
-        batch_token_count = float(y.numel())
-        val_loss_sum += batch_loss.detach().to(torch.float64) * batch_token_count
-        val_token_count += batch_token_count
-
-        # BPB byte counting (same as eval_val).
-        prev_ids = x.reshape(-1)
-        tgt_ids = y.reshape(-1)
+            logits = dyn_base.forward_logits(x, bg)
+        score_len = min(dyn_stride, end - start)
+        scored_logits = logits[:, -score_len:]
+        scored_targets = y[:, -score_len:]
+        loss = F.cross_entropy(scored_logits.reshape(-1, scored_logits.size(-1)).float(),
+                               scored_targets.reshape(-1), reduction="mean")
+        val_loss_sum += loss.detach().to(torch.float64) * score_len
+        val_token_count += score_len
+        prev_for_bpb = x[0, -(score_len + 1):-1] if score_len < seq_len else x[0, :score_len]
+        tgt_ids = scored_targets.reshape(-1)
         token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_for_bpb[-score_len:]]).to(dtype=torch.int16)
         val_byte_count += token_bytes.to(torch.float64).sum()
-
-        # Gradient update — improves predictions for next batch.
-        batch_loss.backward()
+        # Gradient update on scored tokens.
+        loss.backward()
         dyn_optimizer.step()
         dyn_optimizer.zero_grad(set_to_none=True)
-
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
