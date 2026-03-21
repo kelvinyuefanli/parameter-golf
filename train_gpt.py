@@ -280,8 +280,8 @@ def eval_val(
     win_start = (num_windows * rank) // world_size
     win_end = (num_windows * (rank + 1)) // world_size
 
-    # Batch size for sliding window. Cap at 32 to avoid OOM on eval.
-    max_batch = min(32, max(1, args.val_batch_size // seq_len))
+    # Batch size: fit as many windows as we can. Each window is seq_len tokens.
+    max_batch = max(1, args.val_batch_size // seq_len)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
