@@ -68,7 +68,8 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # QAT: enable fake quantization in last fraction of training.
-    qat_fraction = float(os.environ.get("QAT_FRACTION", 0.2))
+    qat_fraction = float(os.environ.get("QAT_FRACTION", 0.35))
+    prune_fraction = float(os.environ.get("PRUNE_FRACTION", 0.03))
 
     # LAWA: average last k checkpoints during warmdown.
     lawa_k = int(os.environ.get("LAWA_K", 5))
@@ -1399,6 +1400,13 @@ def main() -> None:
     if swa_state is not None:
         base_model.load_state_dict(swa_state, strict=True)
         log0(f"swa:loaded averaged weights (count:{swa_count})")
+
+    if args.prune_fraction > 0:  # Magnitude pruning: zero smallest weights for better quantization.
+        with torch.no_grad():
+            for _, p in base_model.named_parameters():
+                if p.ndim == 2 and p.numel() > 1024:
+                    p.mul_(p.abs() >= torch.quantile(p.abs().flatten().float(), args.prune_fraction))
+        log0(f"pruned:{args.prune_fraction*100:.1f}% of weights by magnitude")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
