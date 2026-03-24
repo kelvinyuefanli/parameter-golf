@@ -1074,7 +1074,9 @@ def main() -> None:
         smeargate=args.smeargate,
         bigram_buckets=args.bigram_buckets,
         bigram_dim=args.bigram_dim,
-    ).to(device).bfloat16()
+    ).to(device)
+    if not args.eval_only:
+        base_model.bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
