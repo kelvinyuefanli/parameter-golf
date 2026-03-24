@@ -53,6 +53,8 @@ class Hyperparameters:
     vrl = bool(int(os.environ.get("VRL", "1")))
     # EMA decay for weight averaging (replaces SWA).
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    # Hyper-Connections: n=2 streams for richer cross-layer flow.
+    hc_n = int(os.environ.get("HC_N", 2))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3600))
@@ -741,6 +743,7 @@ class Block(nn.Module):
         layer_idx: int = 0,
         rope_dims: int = 16,
         use_xsa: bool = False,
+        hc_n: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -751,16 +754,37 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        # LN Scale: 1/sqrt(layer_idx+1) dampens deeper layer contributions.
         self.ln_scale = 1.0 / math.sqrt(layer_idx + 1)
+        # Hyper-Connections n=2: learned mixing of n hidden streams.
+        # A_m merges n streams into 1 for the layer, B distributes output back to n.
+        # A_r provides width-connections between streams (residual routing).
+        self.hc_n = hc_n
+        if hc_n > 1:
+            # A_m: [n] merge weights, B: [n] distribute weights, A_r: [n, n] residual routing
+            self.hc_Am = nn.Parameter(torch.ones(hc_n, dtype=torch.float32) / hc_n)
+            self.hc_B = nn.Parameter(torch.ones(hc_n, dtype=torch.float32))
+            self.hc_Ar = nn.Parameter(torch.eye(hc_n, dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor, v_first: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, x0: Tensor, v_first: Tensor | None = None,
+                H: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # Hyper-Connections: merge H streams → single input for layer.
+        if H is not None and self.hc_n > 1:
+            Am = self.hc_Am.to(dtype=x.dtype)
+            x = (H * Am[None, :, None, None]).sum(dim=1)  # [B, n, T, D] → [B, T, D]
         attn_out, v_out = self.attn(self.attn_norm(x), v_first)
         x = x + self.ln_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.ln_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x, v_out
+        # Hyper-Connections: distribute output back to n streams.
+        if H is not None and self.hc_n > 1:
+            B = self.hc_B.to(dtype=x.dtype)
+            Ar = self.hc_Ar.to(dtype=x.dtype)
+            # New H = B * layer_output + Ar @ old_H
+            layer_out = x.unsqueeze(1) * B[None, :, None, None]  # [B, n, T, D]
+            H_new = layer_out + torch.einsum('ij,bjtd->bitd', Ar, H)
+            return x, v_out, H_new
+        return x, v_out, None
 
 class GPT(nn.Module):
     # Depth-recurrent GPT: num_layers unique blocks looped num_loops times.
@@ -788,6 +812,7 @@ class GPT(nn.Module):
         xsa_layers: int = 4,
         rope_dims: int = 16,
         vrl: bool = True,
+        hc_n: int = 2,
     ):
         super().__init__()
         self.num_loops = num_loops
@@ -829,7 +854,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   layer_idx=i, rope_dims=rope_dims,
-                  use_xsa=(i >= num_layers - xsa_layers))
+                  use_xsa=(i >= num_layers - xsa_layers), hc_n=hc_n)
             for i in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -870,13 +895,14 @@ class GPT(nn.Module):
             x = x + self.bigram_proj(self.bigram_embed(bigram_ids))
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        # U-Net skip: first half stores, second half consumes (symmetric around middle).
         num_enc = self.num_layers // 2
         skips: list[Tensor] = []
         v_first: Tensor | None = None
+        # Hyper-Connections: expand x to n=2 streams.
+        hc_n = self.blocks[0].hc_n if self.blocks else 1
+        H = x.unsqueeze(1).expand(-1, hc_n, -1, -1).clone() if hc_n > 1 else None
         for block_idx, block in enumerate(self.blocks):
-            x, v_out = block(x, x0, v_first if self.vrl else None)
-            # VRL: save first layer's V for residual to all subsequent layers.
+            x, v_out, H = block(x, x0, v_first if self.vrl else None, H)
             if block_idx == 0 and self.vrl:
                 v_first = v_out
             if block_idx < num_enc:
@@ -884,6 +910,9 @@ class GPT(nn.Module):
             elif skips:
                 skip_idx = len(skips) - 1
                 x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+        # Hyper-Connections: contract H streams to single output.
+        if H is not None:
+            x = H.sum(dim=1)
         return self.final_norm(x)
 
     def _logits(self, x: Tensor) -> Tensor:
@@ -1020,6 +1049,7 @@ def main() -> None:
         xsa_layers=args.xsa_layers,
         rope_dims=args.rope_dims,
         vrl=args.vrl,
+        hc_n=args.hc_n,
     ).to(device)
     if not args.eval_only:
         base_model.bfloat16()
