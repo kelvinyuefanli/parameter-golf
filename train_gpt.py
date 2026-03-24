@@ -372,12 +372,14 @@ def eval_val_ttt(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     byte_sum = torch.zeros((), device=device, dtype=torch.float64)
     tok_sum = torch.zeros((), device=device, dtype=torch.float64)
+    # Distribute windows across GPUs: each GPU handles windows [rank, rank+ws, rank+2*ws, ...]
+    my_windows = list(range(rank, nwin, world_size))
     for epoch in range(args.ttt_epochs):
-        for bs in range(0, nwin, mb):
-            be = min(bs + mb, nwin)
-            bsz = be - bs
+        for bi in range(0, len(my_windows), mb):
+            batch_wins = my_windows[bi:bi+mb]
+            bsz = len(batch_wins)
             xl, yl = [], []
-            for wi in range(bs, be):
+            for wi in batch_wins:
                 s = wi * stride
                 w = val_tokens[s:min(s + seq_len, total) + 1].to(dtype=torch.int64)
                 if w.numel() - 1 < seq_len: w = F.pad(w, (0, seq_len - w.numel() + 1), value=0)
