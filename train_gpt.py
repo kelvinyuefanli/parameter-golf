@@ -1319,10 +1319,6 @@ def main() -> None:
 
         step += 1
 
-        # QAT is pre-enabled before compile (full-training QAT).
-        elif args.qat_fraction >= 1.0 and not qat_enabled:
-            qat_enabled = True  # Already enabled pre-compile
-
         # EMA: update exponential moving average every step.
         if step >= args.ema_start_step:
             with torch.no_grad():
