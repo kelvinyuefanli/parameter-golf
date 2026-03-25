@@ -1061,17 +1061,6 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
         log0(f"eval_only val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} time:{1000*(time.perf_counter()-t0):.0f}ms")
-        # LoRA TTT in eval-only mode
-        if args.ttt_enabled and args.ttt_lora_rank > 0:
-            base_model.load_state_dict(clean_sd, strict=True)  # Reload fresh weights
-            torch.cuda.synchronize()
-            t_ttt = time.perf_counter()
-            ttt_val_loss, ttt_val_bpb = eval_val_ttt(
-                args, model, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            )
-            torch.cuda.synchronize()
-            log0(f"eval_only ttt val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} time:{1000*(time.perf_counter()-t_ttt):.0f}ms")
         if distributed: dist.destroy_process_group()
         return
 
