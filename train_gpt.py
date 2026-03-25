@@ -692,12 +692,11 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        # LeakyReLU(0.5)² — better than relu² at small scale (avoids dead neurons)
         return self.proj(F.leaky_relu(self.fc(x), 0.5).square())
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, layer_idx: int = 0):
+                 rope_base: float, qk_gain_init: float):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -706,13 +705,12 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.ln_scale = 1.0 / math.sqrt(layer_idx + 1)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        x = x + self.ln_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
-        x = x + self.ln_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 class GPT(nn.Module):
@@ -776,8 +774,8 @@ class GPT(nn.Module):
         self.num_skip = num_skip
 
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i)
-            for i in range(num_layers)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(num_layers)
         ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
