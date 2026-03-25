@@ -1060,17 +1060,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # QAT: enable STE fake-quant BEFORE compile so it's traced into the graph.
-    # The _qat flag starts True but actual noise injection is gated by a global
-    # that we flip during training (starts off, turns on when LR < 0.15).
-    if args.qat_fraction > 0 and not args.eval_only:
-        for block in base_model.blocks:
-            for m in block.attn.modules():
-                if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.quant_bits
-            for m in block.mlp.modules():
-                if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.mlp_bits
+    # Late QAT: _qat starts False, activated when LR scale < 0.15 during warmdown.
+    # No fullgraph=True, so torch.compile allows dynamic branch on _qat flag.
     if not args.eval_only:
-        base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        base_model = torch.compile(base_model, dynamic=False)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     # Optimizer split:
@@ -1318,6 +1311,17 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+
+        # Late QAT: activate when LR scale drops below 0.15 during warmdown.
+        if not qat_enabled and args.qat_fraction > 0 and scale < 0.15:
+            qat_enabled = True
+            raw = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+            for block in raw.blocks:
+                for m in block.attn.modules():
+                    if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.quant_bits
+                for m in block.mlp.modules():
+                    if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.mlp_bits
+            log0(f"qat:enabled at step {step} lr_scale:{scale:.3f}")
 
         # EMA: update exponential moving average every step.
         if step >= args.ema_start_step:
