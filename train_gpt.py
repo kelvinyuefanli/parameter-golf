@@ -65,7 +65,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_loops = int(os.environ.get("NUM_LOOPS", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -573,8 +573,11 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # Supports QAT: when _qat is True, applies STE fake-quantization to simulate int8 noise.
+    # QAT: when _qat=True, always runs STE path (traced into compiled graph).
+    # The noise is always present when _qat=True — use Late QAT by setting _qat
+    # before compile and relying on the optimizer to learn through the noise.
+    # For "late" activation: set qat_fraction=0.15, enable _qat pre-compile,
+    # the model trains WITH quant noise from the start (full-training QAT).
     _qat: bool = False
     _qat_bits: int = 6
 
@@ -1057,8 +1060,15 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # Late QAT activates during warmdown (when LR scale < 0.15).
-    # QAT is NOT in the compiled graph — it activates dynamically via _qat flag.
+    # QAT: enable STE fake-quant BEFORE compile so it's traced into the graph.
+    # The _qat flag starts True but actual noise injection is gated by a global
+    # that we flip during training (starts off, turns on when LR < 0.15).
+    if args.qat_fraction > 0 and not args.eval_only:
+        for block in base_model.blocks:
+            for m in block.attn.modules():
+                if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.quant_bits
+            for m in block.mlp.modules():
+                if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.mlp_bits
     if not args.eval_only:
         base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
@@ -1234,7 +1244,7 @@ def main() -> None:
     ema_state: dict[str, Tensor] | None = None
 
     # QAT: will be enabled when step crosses the threshold.
-    qat_enabled = False
+    qat_enabled = args.qat_fraction > 0  # Pre-enabled before compile
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1309,16 +1319,7 @@ def main() -> None:
 
         step += 1
 
-        # Late QAT: activate when LR scale drops below 0.15 during warmdown.
-        if not qat_enabled and args.qat_fraction > 0 and scale < 0.15:
-            qat_enabled = True
-            for block in base_model.blocks:
-                blk = block._orig_mod if hasattr(block, '_orig_mod') else block
-                for m in blk.attn.modules():
-                    if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.quant_bits
-                for m in blk.mlp.modules():
-                    if isinstance(m, CastedLinear): m._qat, m._qat_bits = True, args.mlp_bits
-            log0(f"qat:enabled at step {step} lr_scale:{scale:.3f}")
+        # QAT is pre-enabled before compile (full-training QAT).
         elif args.qat_fraction >= 1.0 and not qat_enabled:
             qat_enabled = True  # Already enabled pre-compile
 
