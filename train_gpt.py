@@ -45,16 +45,8 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
-    # XSA: exclusive self-attention on last N layers.
-    xsa_layers = int(os.environ.get("XSA_LAYERS", 4))
-    # Partial RoPE: apply RoPE to only first N dims of each head.
-    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
-    # VRL: value residual learning (residual from layer 1 values to all layers).
-    vrl = bool(int(os.environ.get("VRL", "1")))
     # EMA decay for weight averaging (replaces SWA).
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
-    # Hyper-Connections: n=2 streams for richer cross-layer flow.
-    hc_n = int(os.environ.get("HC_N", 2))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3600))
@@ -661,22 +653,11 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-        rope_dims: int = 16,
-        use_xsa: bool = False,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        self.rope_dims = min(rope_dims, self.head_dim)
-        self.use_xsa = use_xsa
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -684,43 +665,23 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        # Partial RoPE: only apply to first rope_dims dimensions.
-        self.rotary = Rotary(self.rope_dims, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor, v_first: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        # Partial RoPE: only first rope_dims get rotation.
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        rd = self.rope_dims
-        q_rope = apply_rotary_emb(q[..., :rd], cos, sin)
-        k_rope = apply_rotary_emb(k[..., :rd], cos, sin)
-        q = torch.cat([q_rope, q[..., rd:]], dim=-1)
-        k = torch.cat([k_rope, k[..., rd:]], dim=-1)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        # VRL: blend current V with first layer's V.
-        v_out = v  # Save for VRL propagation
-        if v_first is not None:
-            v = 0.5 * v + 0.5 * v_first
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads))
-        # XSA: subtract self-value component from attention output.
-        if self.use_xsa:
-            # v has shape [bsz, num_kv_heads, seqlen, head_dim]
-            # Expand v to match q heads for GQA
-            if self.num_kv_heads != self.num_heads:
-                v_expanded = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            else:
-                v_expanded = v
-            # Project out the self-value direction
-            v_norm = F.normalize(v_expanded, dim=-1)
-            y = y - (y * v_norm).sum(dim=-1, keepdim=True) * v_norm
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y), v_out
+        return self.proj(y)
 
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
@@ -735,59 +696,24 @@ class MLP(nn.Module):
         return self.proj(F.leaky_relu(self.fc(x), 0.5).square())
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-        layer_idx: int = 0,
-        rope_dims: int = 16,
-        use_xsa: bool = False,
-        hc_n: int = 2,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, layer_idx: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                         rope_dims=rope_dims, use_xsa=use_xsa)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale = 1.0 / math.sqrt(layer_idx + 1)
-        # Hyper-Connections n=2: learned mixing of n hidden streams.
-        # A_m merges n streams into 1 for the layer, B distributes output back to n.
-        # A_r provides width-connections between streams (residual routing).
-        self.hc_n = hc_n
-        if hc_n > 1:
-            # A_m: [n] merge weights, B: [n] distribute weights, A_r: [n, n] residual routing
-            self.hc_Am = nn.Parameter(torch.ones(hc_n, dtype=torch.float32) / hc_n)
-            self.hc_B = nn.Parameter(torch.ones(hc_n, dtype=torch.float32))
-            self.hc_Ar = nn.Parameter(torch.eye(hc_n, dtype=torch.float32))
 
-    def forward(self, x: Tensor, x0: Tensor, v_first: Tensor | None = None,
-                H: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        # Hyper-Connections: merge H streams → single input for layer.
-        if H is not None and self.hc_n > 1:
-            Am = self.hc_Am.to(dtype=x.dtype)
-            x = (H * Am[None, :, None, None]).sum(dim=1)  # [B, n, T, D] → [B, T, D]
-        attn_out, v_out = self.attn(self.attn_norm(x), v_first)
-        x = x + self.ln_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.ln_scale * self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
         x = x + self.ln_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        # Hyper-Connections: distribute output back to n streams.
-        if H is not None and self.hc_n > 1:
-            B = self.hc_B.to(dtype=x.dtype)
-            Ar = self.hc_Ar.to(dtype=x.dtype)
-            # New H = B * layer_output + Ar @ old_H
-            layer_out = x.unsqueeze(1) * B[None, :, None, None]  # [B, n, T, D]
-            H_new = layer_out + torch.einsum('ij,bjtd->bitd', Ar, H)
-            return x, v_out, H_new
-        return x, v_out, None
+        return x
 
 class GPT(nn.Module):
     # Depth-recurrent GPT: num_layers unique blocks looped num_loops times.
@@ -812,10 +738,6 @@ class GPT(nn.Module):
         smeargate: bool = True,
         bigram_buckets: int = 10240,
         bigram_dim: int = 128,
-        xsa_layers: int = 4,
-        rope_dims: int = 16,
-        vrl: bool = True,
-        hc_n: int = 2,
     ):
         super().__init__()
         self.num_loops = num_loops
@@ -823,7 +745,6 @@ class GPT(nn.Module):
         self.model_dim = model_dim
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
-        self.vrl = vrl
 
         # Embedding: factored or standard.
         if embed_rank > 0:
@@ -855,9 +776,7 @@ class GPT(nn.Module):
         self.num_skip = num_skip
 
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  layer_idx=i, rope_dims=rope_dims,
-                  use_xsa=(i >= num_layers - xsa_layers), hc_n=hc_n)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i)
             for i in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -900,22 +819,12 @@ class GPT(nn.Module):
         x0 = x
         num_enc = self.num_layers // 2
         skips: list[Tensor] = []
-        v_first: Tensor | None = None
-        # Hyper-Connections: expand x to n=2 streams.
-        hc_n = self.blocks[0].hc_n if self.blocks else 1
-        H = x.unsqueeze(1).expand(-1, hc_n, -1, -1).clone() if hc_n > 1 else None
         for block_idx, block in enumerate(self.blocks):
-            x, v_out, H = block(x, x0, v_first if self.vrl else None, H)
-            if block_idx == 0 and self.vrl:
-                v_first = v_out
+            x = block(x, x0)
             if block_idx < num_enc:
                 skips.append(x)
             elif skips:
-                skip_idx = len(skips) - 1
-                x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-        # Hyper-Connections: contract H streams to single output.
-        if H is not None:
-            x = H.sum(dim=1)
+                x = x + self.skip_weights[len(skips) - 1].to(dtype=x.dtype)[None, None, :] * skips.pop()
         return self.final_norm(x)
 
     def _logits(self, x: Tensor) -> Tensor:
@@ -1049,10 +958,6 @@ def main() -> None:
         smeargate=args.smeargate,
         bigram_buckets=args.bigram_buckets,
         bigram_dim=args.bigram_dim,
-        xsa_layers=args.xsa_layers,
-        rope_dims=args.rope_dims,
-        vrl=args.vrl,
-        hc_n=args.hc_n,
     ).to(device)
     if not args.eval_only:
         base_model.bfloat16()
@@ -1063,7 +968,7 @@ def main() -> None:
     # Late QAT: _qat starts False, activated when LR scale < 0.15 during warmdown.
     # No fullgraph=True, so torch.compile allows dynamic branch on _qat flag.
     if not args.eval_only:
-        base_model = torch.compile(base_model, dynamic=False)
+        base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
     # Optimizer split:
