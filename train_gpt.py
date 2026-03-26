@@ -113,6 +113,14 @@ class Hyperparameters:
     eval_only = os.environ.get("EVAL_ONLY", "")
     eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 1.0))
 
+    # Score-first TTT: adapt model on scored chunks during eval.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 32768))  # 32K tokens per chunk
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+
 # MUON OPTIMIZER
 
 _POLAR_EXPRESS_COEFFS = [
@@ -321,6 +329,120 @@ def eval_val(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_ttt(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Score-first legal TTT: score each chunk under inference_mode, then train on it."""
+    seq_len = args.train_seq_len
+    stride = min(args.eval_stride, seq_len) if args.eval_stride > 0 else seq_len
+    chunk_size = args.ttt_chunk_size
+    total_tokens = val_tokens.numel() - 1
+    num_chunks = max(1, total_tokens // chunk_size)
+
+    # SGD optimizer for TTT adaptation.
+    ttt_optimizer = torch.optim.SGD(
+        base_model.parameters(), lr=args.ttt_lr, momentum=args.ttt_momentum,
+    )
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    max_batch = max(1, args.val_batch_size // seq_len)
+
+    for chunk_idx in range(num_chunks):
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, total_tokens)
+        chunk_tokens = val_tokens[chunk_start:chunk_end + 1]
+
+        # --- PHASE 1: SCORE this chunk (no gradients, no weight mutation) ---
+        num_windows = max(1, (chunk_end - chunk_start - seq_len) // stride + 1)
+        # Distribute windows across ranks.
+        my_win_start = (num_windows * rank) // world_size
+        my_win_end = (num_windows * (rank + 1)) // world_size
+
+        base_model.eval()
+        with torch.inference_mode():
+            for batch_start in range(my_win_start, my_win_end, max_batch):
+                batch_end = min(batch_start + max_batch, my_win_end)
+                x_list, y_list = [], []
+                for win_idx in range(batch_start, batch_end):
+                    ws = win_idx * stride
+                    we = min(ws + seq_len, chunk_end - chunk_start)
+                    window = chunk_tokens[ws:we + 1].to(dtype=torch.int64)
+                    if window.numel() - 1 < seq_len:
+                        window = F.pad(window, (0, seq_len - (window.numel() - 1)), value=0)
+                    x_list.append(window[:seq_len])
+                    y_list.append(window[1:seq_len + 1])
+                x = torch.stack(x_list).to(device=device, non_blocking=True)
+                y = torch.stack(y_list).to(device=device, non_blocking=True)
+                raw = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+                bg = raw._compute_bigram_ids(x) if hasattr(raw, 'bigram_buckets') and raw.bigram_buckets > 0 else None
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = base_model.forward_logits(x, bg)
+                score_len = stride
+                scored_logits = logits[:, -score_len:].reshape(-1, logits.size(-1))
+                scored_targets = y[:, -score_len:].reshape(-1)
+                loss = F.cross_entropy(scored_logits.float(), scored_targets, reduction="sum")
+                val_loss_sum += loss.to(torch.float64)
+                val_token_count += (batch_end - batch_start) * score_len
+                prev_ids = x[:, -(score_len + 1):-1].reshape(-1) if seq_len > score_len else x[:, :score_len].reshape(-1)
+                tgt_ids = scored_targets
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+
+        # --- PHASE 2: TRAIN on this chunk (adapt model for future chunks) ---
+        # Skip training on the last chunk (nothing after it to benefit).
+        if chunk_idx < num_chunks - 1:
+            base_model.train()
+            chunk_x = chunk_tokens[:-1].to(device=device, dtype=torch.int64)
+            chunk_y = chunk_tokens[1:].to(device=device, dtype=torch.int64)
+            n_seqs = chunk_x.numel() // seq_len
+            if n_seqs > 0:
+                chunk_x = chunk_x[:n_seqs * seq_len].reshape(n_seqs, seq_len)
+                chunk_y = chunk_y[:n_seqs * seq_len].reshape(n_seqs, seq_len)
+                # Cosine LR decay across TTT epochs.
+                total_ttt_steps = args.ttt_epochs * n_seqs
+                ttt_step = 0
+                for epoch in range(args.ttt_epochs):
+                    for i in range(n_seqs):
+                        # Cosine LR schedule.
+                        lr_scale = 0.5 * (1.0 + math.cos(math.pi * ttt_step / total_ttt_steps))
+                        for pg in ttt_optimizer.param_groups:
+                            pg['lr'] = args.ttt_lr * lr_scale
+                        ttt_optimizer.zero_grad(set_to_none=True)
+                        x_i = chunk_x[i:i+1]
+                        y_i = chunk_y[i:i+1]
+                        raw = base_model._orig_mod if hasattr(base_model, '_orig_mod') else base_model
+                        bg = raw._compute_bigram_ids(x_i) if hasattr(raw, 'bigram_buckets') and raw.bigram_buckets > 0 else None
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                            ttt_loss = base_model(x_i, y_i, bg)
+                        ttt_loss.backward()
+                        if args.ttt_grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.ttt_grad_clip)
+                        ttt_optimizer.step()
+                        ttt_step += 1
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
@@ -1335,14 +1457,23 @@ def main() -> None:
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
-    # LoRA TTT: score-first test-time training during eval window.
-    if args.ttt_enabled and args.ttt_lora_rank > 0:
-        # Reload quantized weights fresh (TTT modifies the model).
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    # Score-first TTT: adapt model on scored chunks during eval window.
+    if args.ttt_enabled:
+        # Create FRESH model for TTT (TTT modifies weights).
+        ttt_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, num_loops=args.num_loops,
+            model_dim=args.model_dim, num_heads=args.num_heads, num_kv_heads=args.num_kv_heads,
+            mlp_mult=args.mlp_mult, embed_rank=args.embed_rank, tie_embeddings=args.tie_embeddings,
+            tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            smeargate=args.smeargate, bigram_buckets=args.bigram_buckets, bigram_dim=args.bigram_dim,
+        ).to(device).bfloat16()
+        restore_low_dim_params_to_fp32(ttt_model)
+        ttt_model.load_state_dict(dq_sd, strict=True)
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         ttt_val_loss, ttt_val_bpb = eval_val_ttt(
-            args, model, rank, world_size, device,
+            args, ttt_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
         torch.cuda.synchronize()
