@@ -100,7 +100,7 @@ class Hyperparameters:
 
     # Quantization bit width for export. mlp_bits=5 uses int5 for MLP weights (better compression).
     quant_bits = int(os.environ.get("QUANT_BITS", 6))
-    mlp_bits = int(os.environ.get("MLP_BITS", 5))
+    mlp_bits = int(os.environ.get("MLP_BITS", 6))  # int6 everywhere (matching winner)
 
     # SmearGate: blend adjacent token embeddings.
     smeargate = bool(int(os.environ.get("SMEARGATE", "1")))
@@ -966,8 +966,10 @@ def main() -> None:
     # Late QAT: _qat starts False, activated when LR scale < 0.15 during warmdown.
     # No fullgraph=True, so torch.compile allows dynamic branch on _qat flag.
     if not args.eval_only:
-        base_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_model = base_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - embedding params (Adam) use EMBED_LR / TIED_EMBED_LR
@@ -1048,10 +1050,11 @@ def main() -> None:
         log0(f"eval_only: loading {args.eval_only}")
         with open(args.eval_only, "rb") as f:
             blob = f.read()
-        if HAS_ZSTD:
-            raw_data = zstd.ZstdDecompressor().decompress(blob, max_output_size=200_000_000)
-        else:
-            raw_data = zlib.decompress(blob)
+        import lzma as _lzma
+        try:
+            raw_data = _lzma.decompress(blob)
+        except _lzma.LZMAError:
+            raw_data = zlib.decompress(blob)  # fallback for old models
         quant_state = torch.load(io.BytesIO(raw_data), map_location="cpu")
         dq_sd = dequantize_state_dict_int8(quant_state)
         clean_sd = {k.replace("_orig_mod.", ""): v for k, v in dq_sd.items()}
@@ -1275,10 +1278,8 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    if HAS_ZSTD:
-        quant_blob = zstd.ZstdCompressor(level=22).compress(quant_raw)
-    else:
-        quant_blob = zlib.compress(quant_raw, level=9)
+    import lzma as _lzma
+    quant_blob = _lzma.compress(quant_raw, preset=6)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1296,17 +1297,28 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    if HAS_ZSTD:
-        raw_data = zstd.ZstdDecompressor().decompress(quant_blob_disk, max_output_size=200_000_000)
-    else:
-        raw_data = zlib.decompress(quant_blob_disk)
+    import lzma as _lzma
+    raw_data = _lzma.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(raw_data), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    dq_sd = dequantize_state_dict_int8(quant_state)
+    # Create a FRESH model for quant eval (avoids stale compiled graph issues).
+    eval_model = GPT(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, num_loops=args.num_loops,
+        model_dim=args.model_dim, num_heads=args.num_heads, num_kv_heads=args.num_kv_heads,
+        mlp_mult=args.mlp_mult, embed_rank=args.embed_rank, tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std, logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        smeargate=args.smeargate, bigram_buckets=args.bigram_buckets, bigram_dim=args.bigram_dim,
+    ).to(device).bfloat16()
+    restore_low_dim_params_to_fp32(eval_model)
+    eval_model.load_state_dict(dq_sd, strict=True)
+    eval_compiled = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    eval_wrapped = DDP(eval_compiled, device_ids=[local_rank], broadcast_buffers=False) if distributed else eval_compiled
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
+        eval_wrapped,
         rank,
         world_size,
         device,
